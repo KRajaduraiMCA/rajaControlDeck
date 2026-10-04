@@ -1,0 +1,42 @@
+rules_version = '2';
+
+// Uploaded files (Salesforce design docs, diagrams, PDFs) live at:
+//   /families/{ownerUid}/designs/{recordId}/{fileName}
+//
+// Read/write only allowed for the owner or an email in their
+// /access/{ownerUid}.members allowlist (checked via Firestore, same
+// source of truth as the Firestore rules — one allowlist to manage).
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(ownerUid) {
+      return isSignedIn() && request.auth.uid == ownerUid;
+    }
+
+    function isFamilyMember(ownerUid) {
+      return isSignedIn() &&
+        firestore.exists(/databases/(default)/documents/access/$(ownerUid)) &&
+        request.auth.token.email in
+          firestore.get(/databases/(default)/documents/access/$(ownerUid)).data.members;
+    }
+
+    function isAllowed(ownerUid) {
+      return isOwner(ownerUid) || isFamilyMember(ownerUid);
+    }
+
+    match /families/{ownerUid}/designs/{recordId}/{fileName} {
+      allow read, write: if isAllowed(ownerUid);
+      // Basic hygiene: cap individual uploads at 25MB.
+      allow write: if request.resource.size < 25 * 1024 * 1024;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

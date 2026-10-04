@@ -1,0 +1,190 @@
+rules_version = '2';
+
+// Data model:
+//   /access/{ownerUid}                                -> { ownerEmail, members: [emails...] }
+//   /families/{ownerUid}/permissions/{email}           -> { modules: { moduleKey: 'view'|'full', ... } }
+//   /families/{ownerUid}/modules/{moduleKey}/records/{recordId}
+//   /families/{ownerUid}/customModules/{moduleKey}     -> user-created option definitions
+//   /families/{ownerUid}/vault/config                  -> encrypted vault salt + verifier
+//   /families/{ownerUid}/presence/{uid}                -> last-login heartbeat
+//   /families/{ownerUid}/trash/{recordId}              -> soft-deleted records, restorable
+//   /families/{ownerUid}/settings/hiddenModules        -> { keys: [moduleKey,...] } built-in pages hidden from menu
+//   /families/{ownerUid}/settings/moduleGroups         -> { assignments: {moduleKey: categoryName} }
+//   /families/{ownerUid}/modules/{moduleKey}/activity/{entryId} -> per-module recent-activity log, append-only
+//   /families/{ownerUid}/knownDevices/{email}          -> { ips: [...] } previously-seen IPs per person
+//   /families/{ownerUid}/loginLog/{entryId}            -> sign-in history: who, when, IP, location, device
+//   /families/{ownerUid}/deniedAttempts/{entryId}      -> authenticated-but-not-allowlisted sign-in attempts
+//
+// Only the owner (ownerUid == their own auth uid) or an email listed in
+// /access/{ownerUid}.members may read or write that owner's data.
+//
+// A family member's access to individual MODULES is further controlled per-module
+// via /families/{ownerUid}/permissions/{email}, with two levels:
+//   'view' - can read that module's records but cannot create/edit/delete them
+//   'full' - can read and write
+// If no permissions doc exists for a member, they default to full access on
+// everything (so adding this feature never silently locks out existing members) -
+// the owner opts a member INTO restrictions by setting one up. If a permissions
+// doc exists but a specific moduleKey isn't listed in it, that module is denied
+// entirely for that member.
+
+function isSignedIn() {
+  return request.auth != null;
+}
+
+function isOwner(ownerUid) {
+  return isSignedIn() && request.auth.uid == ownerUid;
+}
+
+function isFamilyMember(ownerUid) {
+  return isSignedIn() &&
+    exists(/databases/$(database)/documents/access/$(ownerUid)) &&
+    request.auth.token.email in
+      get(/databases/$(database)/documents/access/$(ownerUid)).data.members;
+}
+
+function isAllowed(ownerUid) {
+  return isOwner(ownerUid) || isFamilyMember(ownerUid);
+}
+
+function permissionsPath(ownerUid) {
+  return /databases/$(database)/documents/families/$(ownerUid)/permissions/$(request.auth.token.email);
+}
+
+// 'full' (no restrictions ever set), the stored level for this moduleKey, or
+// 'none' if a permissions doc exists but doesn't mention this moduleKey.
+function moduleAccessLevel(ownerUid, moduleKey) {
+  return !exists(permissionsPath(ownerUid))
+    ? 'full'
+    : (moduleKey in get(permissionsPath(ownerUid)).data.modules
+        ? get(permissionsPath(ownerUid)).data.modules[moduleKey]
+        : 'none');
+}
+
+function canReadModule(ownerUid, moduleKey) {
+  return isOwner(ownerUid) ||
+    (isFamilyMember(ownerUid) && moduleAccessLevel(ownerUid, moduleKey) != 'none');
+}
+
+function canWriteModule(ownerUid, moduleKey) {
+  return isOwner(ownerUid) ||
+    (isFamilyMember(ownerUid) && moduleAccessLevel(ownerUid, moduleKey) == 'full');
+}
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // The allowlist document itself: only the owner can create/edit it
+    // (so a family member can never grant themselves or anyone else access).
+    match /access/{ownerUid} {
+      allow read: if isAllowed(ownerUid);
+      allow create, update, delete: if isOwner(ownerUid);
+    }
+
+    // Per-member module restrictions: members may read their OWN permissions
+    // doc (so the app can filter their own nav), but only the owner can
+    // write any permissions doc (a member can never grant themselves access).
+    match /families/{ownerUid}/permissions/{email} {
+      allow read: if isOwner(ownerUid) ||
+        (isSignedIn() && request.auth.token.email == email && isFamilyMember(ownerUid));
+      allow write: if isOwner(ownerUid);
+    }
+
+    // Module records - the actual data - are gated per-module, with read and
+    // write evaluated separately so "view only" access is real, not just a
+    // hidden button in the UI.
+    match /families/{ownerUid}/modules/{moduleKey}/records/{recordId} {
+      allow read: if canReadModule(ownerUid, moduleKey);
+      allow write: if canWriteModule(ownerUid, moduleKey);
+    }
+
+    // Custom (user-created) module definitions follow the same rule.
+    match /families/{ownerUid}/customModules/{moduleKey} {
+      allow read: if canReadModule(ownerUid, moduleKey);
+      allow write: if canWriteModule(ownerUid, moduleKey);
+    }
+
+    // Non-module account data: vault config is not page-specific, gated by
+    // plain family membership. Presence is per-person: the owner can see
+    // everyone (for the Home dashboard), but a family member can only ever
+    // read their OWN heartbeat, not other members' IP/location.
+    match /families/{ownerUid}/vault/{doc} {
+      allow read, write: if isAllowed(ownerUid);
+    }
+    match /families/{ownerUid}/presence/{uid} {
+      allow read: if isOwner(ownerUid) ||
+        (isSignedIn() && request.auth.uid == uid && isFamilyMember(ownerUid));
+      allow write: if isSignedIn() && request.auth.uid == uid && isAllowed(ownerUid);
+    }
+
+    // Recycle bin: only the owner can browse, restore, or purge it (matches
+    // the app's UI, which never shows this to family members) - a trashed
+    // item can otherwise come from ANY module, so letting family members
+    // read the bin would bypass their per-module restrictions entirely.
+    // Creating a new trash entry (i.e. deleting a live record) is still
+    // allowed for whoever already has write access to that specific module,
+    // so a family member's own deletions stay recoverable by the owner.
+    match /families/{ownerUid}/trash/{recordId} {
+      allow read, update, delete: if isOwner(ownerUid);
+      allow create: if isOwner(ownerUid) ||
+        (isFamilyMember(ownerUid) && canWriteModule(ownerUid, request.resource.data.moduleKey));
+    }
+
+    // App settings (hidden pages, category assignments): everyone allowed
+    // can read (so their nav renders correctly), only the owner can change it.
+    match /families/{ownerUid}/settings/{doc} {
+      allow read: if isAllowed(ownerUid);
+      allow write: if isOwner(ownerUid);
+    }
+
+    // Activity log, scoped per-module exactly like the records themselves -
+    // NOT one shared collection, so a restricted family member's browser
+    // never even receives another page's activity entries (their summaries
+    // can contain that page's actual data, e.g. a record's title).
+    match /families/{ownerUid}/modules/{moduleKey}/activity/{entryId} {
+      allow read: if canReadModule(ownerUid, moduleKey);
+      allow create: if canWriteModule(ownerUid, moduleKey);
+      allow update: if false;
+      allow delete: if isOwner(ownerUid);
+    }
+
+    // Known IPs per person, used to detect "new device" sign-ins. A person
+    // may only read/write their OWN record (keyed by their email) - nobody
+    // can see or tamper with someone else's known-device list except the owner.
+    match /families/{ownerUid}/knownDevices/{email} {
+      allow read: if isOwner(ownerUid) ||
+        (isSignedIn() && request.auth.token.email == email && isFamilyMember(ownerUid));
+      allow write: if isSignedIn() && request.auth.token.email == email && isAllowed(ownerUid);
+    }
+
+    // Sign-in log (IP/location/device per login). Only the owner can read
+    // it - a family member's login location is not something other family
+    // members should see, only the account owner reviewing for security.
+    // A person may only ever write an entry for their OWN email.
+    match /families/{ownerUid}/loginLog/{entryId} {
+      allow read: if isOwner(ownerUid);
+      allow create: if isSignedIn() && request.auth.token.email == request.resource.data.email && isAllowed(ownerUid);
+      allow update, delete: if isOwner(ownerUid);
+    }
+
+    // Denied-access attempts: someone who genuinely authenticated with
+    // Google/email+password (so this isn't an open/anonymous write - it
+    // requires a real account) but wasn't on the family allowlist. They may
+    // log exactly one entry for their OWN email; only the owner can read
+    // or clear the log. This intentionally does NOT cover wrong-password
+    // guesses or cancelled sign-ins, since those happen before any real
+    // authentication succeeds - logging those safely would require an
+    // open write endpoint reachable by anyone, authenticated or not, which
+    // is a worse security tradeoff than not having that specific visibility.
+    match /families/{ownerUid}/deniedAttempts/{entryId} {
+      allow read: if isOwner(ownerUid);
+      allow create: if isSignedIn() && request.auth.token.email == request.resource.data.email;
+      allow update, delete: if isOwner(ownerUid);
+    }
+
+    // Deny everything else by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
